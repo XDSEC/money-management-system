@@ -1,0 +1,8 @@
+{
+  "name": "association-fund-ledger",
+  "version": "1.0.0",
+  "private": true,
+  "engines": { "node": ">=22.0.0" },
+  "dependencies": { "pdfjs-dist": "6.5.438" },
+  "scripts": { "start": "node server.js" }
+}
