@@ -1,0 +1,21 @@
+# Dependencies are installed inside the image
+node_modules
+
+# Private data: database and uploaded receipts must never enter the image
+data
+dist
+
+# Local-only files and secrets
+.git
+.gitignore
+.gitattributes
+.claude
+.env
+.env.*
+*.log
+pnpm-lock.yaml
+
+# Container files themselves
+Dockerfile
+.dockerignore
+docker-compose.yml

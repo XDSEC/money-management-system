@@ -4,5 +4,10 @@
   "private": true,
   "engines": { "node": ">=22.0.0" },
   "dependencies": { "pdfjs-dist": "6.5.438" },
-  "scripts": { "start": "node server.js" }
+  "scripts": {
+    "start": "node server.js",
+    "build:binary": "node scripts/build-binary.mjs",
+    "build:binary:linux-arm64": "node scripts/build-binary.mjs linux-arm64",
+    "build:binary:windows": "node scripts/build-binary.mjs windows-x64"
+  }
 }

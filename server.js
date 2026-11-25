@@ -1,10 +1,22 @@
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
+// 用 bun build --compile 打成单文件后，__dirname 是构建时的源码目录而不是可执行文件所在目录。
+// 因此编译版本改用 process.execPath 的目录作为 BASE，这样 index.html、app.js、.env、data/
+// 等外部文件都能放在二进制文件旁边。普通 node/bun 运行仍使用源码目录。
+const BASE = process.env.LEDGER_BASE_DIR
+  ? path.resolve(process.env.LEDGER_BASE_DIR)
+  : (typeof Bun !== 'undefined' && Bun.isStandaloneExecutable ? path.dirname(process.execPath) : __dirname);
+// 读取 .env（已存在的环境变量优先，不会被覆盖）。
+try { process.loadEnvFile(path.join(BASE, '.env')); } catch {}
 const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
+const startBot = require('./bot');
 
-const DATA = path.join(__dirname, 'data');
+// PDF 预览依赖：优先使用二进制旁边的 vendor/，其次 node_modules/pdfjs-dist。
+const VENDOR_ROOTS = [path.join(BASE, 'vendor'), path.join(BASE, 'node_modules', 'pdfjs-dist')];
+function vendorFile(rel) { for (const root of VENDOR_ROOTS) { const f = path.join(root, rel); if (fs.existsSync(f)) return f; } return null; }
+const DATA = process.env.LEDGER_DATA_DIR ? path.resolve(process.env.LEDGER_DATA_DIR) : path.join(BASE, 'data');
 const FILES = path.join(DATA, 'receipts');
 fs.mkdirSync(FILES, { recursive: true });
 const db = new DatabaseSync(path.join(DATA, 'ledger.sqlite'));
@@ -13,6 +25,7 @@ CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,name TEXT UNIQUE NOT NULL,p
 CREATE TABLE IF NOT EXISTS entries(id TEXT PRIMARY KEY,kind TEXT NOT NULL CHECK(kind IN ('income','expense')),amount_cents INTEGER NOT NULL CHECK(amount_cents>0),reason TEXT NOT NULL,date TEXT NOT NULL,note TEXT NOT NULL DEFAULT '',operator TEXT NOT NULL DEFAULT '',deleted INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,created_by TEXT NOT NULL,updated_at TEXT,updated_by TEXT,deleted_at TEXT,deleted_by TEXT,version INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE IF NOT EXISTS attachments(id TEXT PRIMARY KEY,entry_id TEXT NOT NULL REFERENCES entries(id),name TEXT NOT NULL,file TEXT NOT NULL,mime TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT,entry_id TEXT NOT NULL,action TEXT NOT NULL,by_user TEXT NOT NULL,at TEXT NOT NULL,before_state TEXT,after_state TEXT);
+CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS entries_date_idx ON entries(date);`);
 function transaction(fn) { db.exec('BEGIN IMMEDIATE'); try { const v=fn(); db.exec('COMMIT'); return v; } catch(e) { db.exec('ROLLBACK'); throw e; } }
 const jsonPath = path.join(DATA, 'ledger.json');
@@ -40,21 +53,27 @@ function cents(v) { const s=String(v); if(!/^\d{1,10}(\.\d{1,2})?$/.test(s)||Num
 function entry(id) { const e=db.prepare('SELECT * FROM entries WHERE id=?').get(id); if(!e)return null; return {id:e.id,kind:e.kind,amountCents:e.amount_cents,reason:e.reason,date:e.date,note:e.note,operator:e.operator,deleted:!!e.deleted,createdAt:e.created_at,createdBy:e.created_by,updatedAt:e.updated_at,updatedBy:e.updated_by,deletedAt:e.deleted_at,deletedBy:e.deleted_by,version:e.version,attachments:db.prepare('SELECT id,name,file,mime FROM attachments WHERE entry_id=?').all(id)}; }
 function attMime(a) { if(a.mime&&a.mime!=='application/octet-stream')return a.mime; const ext=(String(a.file).split('.').pop()||'').toLowerCase(); return {pdf:'application/pdf',png:'image/png',jpg:'image/jpeg',jpeg:'image/jpeg',webp:'image/webp'}[ext]||'application/octet-stream'; }
 function snap(e) { return JSON.stringify(e); }
+function getSetting(k,d) { const r=db.prepare('SELECT value FROM settings WHERE key=?').get(k); return r?r.value:d; }
+function setSetting(k,v) { db.prepare('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(k,v); }
+function getBotAdmins() { try { const v=JSON.parse(getSetting('bot.adminQqs','[]')); return Array.isArray(v)?v.map(String):[]; } catch { return []; } }
+function parseAttachment(a) { const m=String(a.data||'').match(/^data:(image\/(?:png|jpeg|webp)|application\/pdf);base64,([\s\S]+)$/); if(!m)return null; const buf=Buffer.from(m[2],'base64'); if(buf.length>4e6)throw Error('Attachment exceeds 4MB'); return {name:String(a.name||'').slice(0,120),buf,mime:m[1]}; }
+function storeUploads(uploads) { const files=[]; for(const u of uploads.slice(0,5)){ const ext=u.mime.split('/')[1].replace('jpeg','jpg'),f=crypto.randomUUID()+'.'+ext; fs.writeFileSync(path.join(FILES,f),u.buf); files.push({name:String(u.name||f).slice(0,120),file:f,mime:u.mime}); } return files; }
+function createEntryRecord(d,uploads) { const id=crypto.randomUUID(),at=new Date().toISOString(),files=storeUploads(uploads||[]); transaction(()=>{ db.prepare('INSERT INTO entries(id,kind,amount_cents,reason,date,note,operator,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?)').run(id,d.kind,d.amountCents,String(d.reason).slice(0,160),d.date,String(d.note||'').slice(0,1000),String(d.operator||'').slice(0,120),at,d.createdBy); for(const f of files)db.prepare('INSERT INTO attachments VALUES(?,?,?,?,?)').run(crypto.randomUUID(),id,f.name,f.file,f.mime); db.prepare('INSERT INTO audit(entry_id,action,by_user,at,after_state) VALUES(?,?,?,?,?)').run(id,'create',d.createdBy,at,snap(entry(id))); }); return id; }
 
 const server=http.createServer(async(req,res)=>{
  try {
   const url=new URL(req.url,'http://localhost'),sid=cookie(req),uid=sessions.get(sid),user=uid?db.prepare('SELECT * FROM users WHERE id=?').get(uid):null;
-  if(req.method==='GET'&&url.pathname==='/'){res.writeHead(200,{'content-type':'text/html; charset=utf-8'});return res.end(fs.readFileSync(path.join(__dirname,'index.html')));}
-  if(req.method==='GET'&&url.pathname==='/app.js'){res.writeHead(200,{'content-type':'text/javascript; charset=utf-8','cache-control':'no-cache'});return fs.createReadStream(path.join(__dirname,'app.js')).pipe(res);}
+  if(req.method==='GET'&&url.pathname==='/'){res.writeHead(200,{'content-type':'text/html; charset=utf-8'});return res.end(fs.readFileSync(path.join(BASE,'index.html')));}
+  if(req.method==='GET'&&url.pathname==='/app.js'){res.writeHead(200,{'content-type':'text/javascript; charset=utf-8','cache-control':'no-cache'});return fs.createReadStream(path.join(BASE,'app.js')).pipe(res);}
   if(req.method==='GET'&&['/vendor/pdf.mjs','/vendor/pdf.worker.mjs'].includes(url.pathname)){
-   const file=path.join(__dirname,'node_modules','pdfjs-dist','build',url.pathname.endsWith('worker.mjs')?'pdf.worker.mjs':'pdf.mjs');
-   if(!fs.existsSync(file))return send(res,503,{error:'PDF viewer dependency missing; run pnpm install'});
+   const file=vendorFile(path.join('build',url.pathname.endsWith('worker.mjs')?'pdf.worker.mjs':'pdf.mjs'));
+   if(!file)return send(res,503,{error:'PDF viewer dependency missing; place vendor/ or node_modules/pdfjs-dist next to the binary'});
    res.writeHead(200,{'content-type':'text/javascript; charset=utf-8','cache-control':'public, max-age=3600'});return fs.createReadStream(file).pipe(res);
   }
   if(req.method==='GET'&&/^\/vendor\/(standard_fonts|cmaps)\/[\w.-]+$/.test(url.pathname)){
    const [,dir,name]=url.pathname.match(/^\/vendor\/(standard_fonts|cmaps)\/([\w.-]+)$/);
-   const file=path.join(__dirname,'node_modules','pdfjs-dist',dir,name);
-   if(!fs.existsSync(file))return send(res,404,{error:'Not found'});
+   const file=vendorFile(path.join(dir,name));
+   if(!file)return send(res,404,{error:'Not found'});
    res.writeHead(200,{'content-type':'application/octet-stream','cache-control':'public, max-age=86400'});return fs.createReadStream(file).pipe(res);
   }
   if(req.method==='GET'&&url.pathname==='/api/setup-status')return send(res,200,{setup:db.prepare('SELECT count(*) n FROM users').get().n===0});
@@ -67,6 +86,8 @@ const server=http.createServer(async(req,res)=>{
   if(req.method==='POST'&&url.pathname==='/api/logout'){sessions.delete(sid);res.setHeader('set-cookie','sid=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/');return send(res,200,{});}
   if(!user)return send(res,401,{error:'Please log in'});
   if(req.method==='GET'&&url.pathname==='/api/me')return send(res,200,{role:user.role,name:user.name});
+  if(req.method==='GET'&&url.pathname==='/api/bot/settings'){if(user.role!=='admin')return send(res,403,{error:'Admin required'});return send(res,200,{adminQqs:getBotAdmins(),connected:bot.isConnected()});}
+  if(req.method==='PUT'&&url.pathname==='/api/bot/settings'){if(user.role!=='admin')return send(res,403,{error:'Admin required'});const b=await readBody(req);const list=[...new Set((Array.isArray(b.adminQqs)?b.adminQqs:[]).map(x=>String(x).trim()).filter(x=>/^\d{5,12}$/.test(x)))].slice(0,100);setSetting('bot.adminQqs',JSON.stringify(list));return send(res,200,{adminQqs:list});}
   if(req.method==='GET'&&url.pathname==='/api/ledger'){
    const from=url.searchParams.get('from')||'0000',to=url.searchParams.get('to')||'9999';
    const rows=db.prepare('SELECT id FROM entries WHERE deleted=0 AND date>=? AND date<=? ORDER BY date DESC,created_at DESC').all(from,to).map(x=>entry(x.id));
@@ -77,9 +98,9 @@ const server=http.createServer(async(req,res)=>{
   if(req.method==='POST'&&url.pathname==='/api/entries'){
    if(user.role!=='admin')return send(res,403,{error:'Admin required'});const b=await readBody(req);
    if(!['income','expense'].includes(b.kind)||!b.reason||!/^\d{4}-\d{2}-\d{2}$/.test(b.date))throw Error('Complete entry fields');if(b.kind==='expense'&&!String(b.operator||'').trim())throw Error('Expense operator required');
-   const id=crypto.randomUUID(),at=new Date().toISOString(),files=[];
-   for(const a of (b.attachments||[]).slice(0,5)){const m=String(a.data||'').match(/^data:(image\/(?:png|jpeg|webp)|application\/pdf);base64,([\s\S]+)$/);if(!m)continue;const buf=Buffer.from(m[2],'base64');if(buf.length>4e6)throw Error('Attachment exceeds 4MB');const ext=m[1].split('/')[1].replace('jpeg','jpg'),f=crypto.randomUUID()+'.'+ext;fs.writeFileSync(path.join(FILES,f),buf);files.push({name:String(a.name||f).slice(0,120),file:f,mime:m[1]});}
-   transaction(()=>{db.prepare('INSERT INTO entries(id,kind,amount_cents,reason,date,note,operator,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?)').run(id,b.kind,cents(b.amount),String(b.reason).slice(0,160),b.date,String(b.note||'').slice(0,1000),String(b.operator||'').slice(0,120),at,user.name);for(const f of files)db.prepare('INSERT INTO attachments VALUES(?,?,?,?,?)').run(crypto.randomUUID(),id,f.name,f.file,f.mime);db.prepare('INSERT INTO audit(entry_id,action,by_user,at,after_state) VALUES(?,?,?,?,?)').run(id,'create',user.name,at,snap(entry(id)));});return send(res,200,entry(id));
+   const uploads=(b.attachments||[]).slice(0,5).map(parseAttachment).filter(Boolean);
+   const id=createEntryRecord({kind:b.kind,amountCents:cents(b.amount),reason:b.reason,date:b.date,note:b.note,operator:b.operator,createdBy:user.name},uploads);
+   return send(res,200,entry(id));
   }
   const m=url.pathname.match(/^\/api\/entries\/([\w-]+)(?:\/receipt\/([\w-]+))?$/);
   if(m&&req.method==='GET'){
@@ -99,9 +120,13 @@ const server=http.createServer(async(req,res)=>{
   if(req.method==='POST'&&url.pathname==='/api/password'){
    if(user.role!=='admin')return send(res,403,{error:'Admin required'});const b=await readBody(req),target=db.prepare('SELECT * FROM users WHERE role=?').get(b.role);if(!target||String(b.password||'').length<10)throw Error('Password must be at least 10 characters');db.prepare('UPDATE users SET pass=? WHERE id=?').run(hash(b.password),target.id);for(const [t,id] of sessions)if(id===target.id)sessions.delete(t);return send(res,200,{});
   }
-  if(req.method==='GET'&&url.pathname==='/api/audit'){if(user.role!=='admin')return send(res,403,{error:'Admin required'});const entryId=url.searchParams.get('entryId');const rows=db.prepare('SELECT a.id,a.entry_id entryId,a.action,a.by_user by,a.at,a.before_state before_state,a.after_state after_state,e.reason,e.kind,e.amount_cents,e.date FROM audit a LEFT JOIN entries e ON e.id=a.entry_id'+(entryId?' WHERE a.entry_id=?':'')+' ORDER BY a.id DESC').all(...(entryId?[entryId]:[]));return send(res,200,rows.map(a=>({id:a.id,entryId:a.entryId,action:a.action,by:a.by,at:a.at,before:a.before_state?JSON.parse(a.before_state):null,after:a.after_state?JSON.parse(a.after_state):null,reason:a.reason,kind:a.kind,amountCents:a.amount_cents,date:a.date})));}
+  if(req.method==='GET'&&url.pathname==='/api/audit'){const entryId=url.searchParams.get('entryId');const rows=db.prepare('SELECT a.id,a.entry_id entryId,a.action,a.by_user by,a.at,a.before_state before_state,a.after_state after_state,e.reason,e.kind,e.amount_cents,e.date FROM audit a LEFT JOIN entries e ON e.id=a.entry_id'+(entryId?' WHERE a.entry_id=?':'')+' ORDER BY a.id DESC').all(...(entryId?[entryId]:[]));return send(res,200,rows.map(a=>({id:a.id,entryId:a.entryId,action:a.action,by:a.by,at:a.at,before:a.before_state?JSON.parse(a.before_state):null,after:a.after_state?JSON.parse(a.after_state):null,reason:a.reason,kind:a.kind,amountCents:a.amount_cents,date:a.date})));}
   return send(res,404,{error:'Not found'});
  }catch(e){if(!res.headersSent)send(res,400,{error:e.message||'Request failed'});}
 });
+const bot=startBot({getAdmins:getBotAdmins,createEntryRecord,cents});
 const PORT=Number(process.env.PORT||3000);
-server.listen(PORT,()=>console.log(`Ledger running at http://localhost:${PORT}`));
+// 可选：HOST=127.0.0.1（只监听本机，配合反向代理）或 HOST=0.0.0.0（仅 IPv4）等。
+const HOST=process.env.HOST;
+const onListen=()=>console.log(`Ledger running at http://${HOST||'localhost'}:${PORT}`);
+if(HOST)server.listen(PORT,HOST,onListen);else server.listen(PORT,onListen);

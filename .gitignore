@@ -15,6 +15,9 @@ data/
 !.env.example
 .claude/settings.local.json
 
+# Bun 单文件构建产物
+dist/
+
 # Logs
 *.log
 npm-debug.log*

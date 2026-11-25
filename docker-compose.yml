@@ -1,0 +1,57 @@
+services:
+  ledger:
+    build: .
+    image: association-ledger:latest
+    container_name: association-ledger
+
+    # .env 只注入容器运行时环境，不会打进镜像（.dockerignore 已排除）。
+    # 已存在的 environment 值优先于 env_file。
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: "${PORT:-3000}"
+      # 容器内必须监听所有地址；对外暴露由下面的 ports 控制。
+      # 这样可以避免 .env 里为二进制部署设置的 HOST=127.0.0.1 让容器无法访问。
+      HOST: "0.0.0.0"
+      LEDGER_DATA_DIR: "/app/data"
+      TZ: "${TZ:-Asia/Shanghai}"
+
+    ports:
+      # 前面有宿主机 nginx/caddy 时，在 .env 里设 BIND_IP=127.0.0.1，
+      # 只把端口暴露给本机，由反向代理对外提供 HTTPS。
+      - "${BIND_IP:-0.0.0.0}:${PORT:-3000}:${PORT:-3000}"
+
+    volumes:
+      - ledger-data:/app/data
+
+    # ---- 隔离与加固 ----
+    user: "1000:1000"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 512m
+    init: true
+
+    restart: unless-stopped
+    stop_grace_period: 15s
+
+    # 只有当 OneBot 运行在宿主机、且 BOT_WS_URL 留空时才需要。
+    # 使用公网/局域网 IP 连接 OneBot 时可以删掉这一项。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  ledger-data:
+    name: ledger-data
