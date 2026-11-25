@@ -9,6 +9,23 @@ const BASE = process.env.LEDGER_BASE_DIR
   : (typeof Bun !== 'undefined' && Bun.isStandaloneExecutable ? path.dirname(process.execPath) : __dirname);
 // 读取 .env（已存在的环境变量优先，不会被覆盖）。
 try { process.loadEnvFile(path.join(BASE, '.env')); } catch {}
+// Ory Kratos 统一账号登录（可选）。未开启时不影响任何既有行为。
+// 需要同时提供 KRATOS_PUBLIC_URL（服务端访问）与 PUBLIC_URL（对外地址，用于拼接登录回调）。
+const KRATOS_ENABLE = String(process.env.KRATOS_ENABLE ?? '0') !== '0';
+const PUBLIC_URL = (process.env.PUBLIC_URL || '').replace(/\/+$/, '');
+const KRATOS_PUBLIC_URL = (process.env.KRATOS_PUBLIC_URL || '').replace(/\/+$/, '');
+// 默认同源反向代理模式：浏览器在账务域名下访问被代理的 Kratos 路径。
+const KRATOS_BROWSER_URL = (process.env.KRATOS_BROWSER_URL || PUBLIC_URL).replace(/\/+$/, '');
+const KRATOS_SESSION_COOKIE = process.env.KRATOS_SESSION_COOKIE || 'ory_kratos_session';
+// Kratos v0.5.x 的浏览器登出端点是 /self-service/browser/flows/logout，
+// v0.6+ 改为 /self-service/logout/browser；登录与 /sessions/whoami 路径各版本一致。
+const KRATOS_LOGOUT_PATH = process.env.KRATOS_LOGOUT_PATH || '/self-service/logout/browser';
+const KRATOS_ENABLED = KRATOS_ENABLE && !!KRATOS_PUBLIC_URL && !!PUBLIC_URL;
+const KRATOS_TIMEOUT_MS = 5000;
+const KRATOS_NEGATIVE_TTL_MS = 60 * 1000;
+const KRATOS_DEFAULT_TTL_MS = 12 * 60 * 60 * 1000;
+const KRATOS_MAX_INFLIGHT = 32;
+if (KRATOS_ENABLE && !KRATOS_ENABLED) console.warn('[kratos] 缺少 KRATOS_PUBLIC_URL 或 PUBLIC_URL，统一账号登录已禁用');
 const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 const startBot = require('./bot');
@@ -45,8 +62,70 @@ if (fs.existsSync(jsonPath) && db.prepare('SELECT count(*) n FROM users').get().
 }
 function hash(p,s=crypto.randomBytes(16).toString('hex')) { return s+':'+crypto.scryptSync(p,s,64).toString('hex'); }
 function valid(p,h) { const [s,v]=h.split(':'); const a=Buffer.from(v||'','hex'),b=crypto.scryptSync(p,s,64); return a.length===b.length&&crypto.timingSafeEqual(a,b); }
-function cookie(req) { return (req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith('sid='))?.slice(4); }
+function readCookie(req,name) { for(const part of (req.headers.cookie||'').split(';')){ const s=part.trim(); if(s.startsWith(name+'=')) return s.slice(name.length+1); } return null; }
+function cookie(req) { return readCookie(req,'sid'); }
+// 本地会话：{userId} 或 Kratos 会话：{kratos:{id,name,expiresAt}}。
 const sessions=new Map();
+const kratosInvalid=new Map();
+let kratosInflight=0;
+function sessionUser(sess) {
+  if(!sess) return null;
+  if(sess.userId){ const u=db.prepare('SELECT * FROM users WHERE id=?').get(sess.userId); return u?{id:u.id,name:u.name,role:u.role,via:'local'}:null; }
+  if(sess.kratos){ if(sess.kratos.expiresAt&&Date.now()>sess.kratos.expiresAt)return null; return {id:null,name:sess.kratos.name,role:'viewer',via:'kratos'}; }
+  return null;
+}
+function issueSession(res,payload) {
+  const token=crypto.randomBytes(32).toString('hex');
+  sessions.set(token,payload);
+  res.setHeader('set-cookie',`sid=${token}; HttpOnly; SameSite=Strict; Path=/`);
+  return token;
+}
+function kratosName(identity) {
+  const t=(identity&&typeof identity.traits==='object'&&identity.traits)||{};
+  const clean=s=>String(s).replace(/[\u0000-\u001f\u007f]/g,'').trim().slice(0,120);
+  for(const v of [t.display_name,t.username,t.preferred_username,t.email]) if(typeof v==='string'&&v.trim())return clean(v);
+  if(typeof t.name==='string'&&t.name.trim())return clean(t.name);
+  if(t.name&&typeof t.name==='object'){ const n=[t.name.first,t.name.last].filter(x=>typeof x==='string'&&x.trim()).join(' ').trim(); if(n)return clean(n); }
+  return '成员 '+String(identity&&identity.id||'').slice(0,8);
+}
+// 返回 {state:'valid',who} / {state:'invalid'} / {state:'error'}。
+// 只有明确无效（401/403 或 active===false）才做短暂负缓存；网络错误不缓存，避免 Kratos 抖动导致静默失效。
+async function kratosWhoami(token) {
+  const miss=kratosInvalid.get(token);
+  if(miss&&miss>Date.now())return {state:'invalid'};
+  if(kratosInvalid.size>1000)kratosInvalid.clear();
+  if(kratosInflight>=KRATOS_MAX_INFLIGHT)return {state:'error'};
+  kratosInflight++;
+  try {
+    const r=await fetch(KRATOS_PUBLIC_URL+'/sessions/whoami',{
+      headers:{accept:'application/json',cookie:KRATOS_SESSION_COOKIE+'='+token},
+      redirect:'manual',signal:AbortSignal.timeout(KRATOS_TIMEOUT_MS)
+    });
+    if(r.status===401||r.status===403){ kratosInvalid.set(token,Date.now()+KRATOS_NEGATIVE_TTL_MS); return {state:'invalid'}; }
+    if(!r.ok)return {state:'error'};
+    const s=await r.json().catch(()=>null),identity=s&&s.identity;
+    const invalid=()=>{ kratosInvalid.set(token,Date.now()+KRATOS_NEGATIVE_TTL_MS); return {state:'invalid'}; };
+    if(!s||s.active===false||!identity||!identity.id)return invalid();
+    if(identity.state&&identity.state!=='active')return invalid();
+    const exp=s.expires_at?Date.parse(s.expires_at):NaN;
+    if(Number.isFinite(exp)&&exp<=Date.now())return invalid();
+    return {state:'valid',who:{id:String(identity.id),name:kratosName(identity),expiresAt:Number.isFinite(exp)?exp:Date.now()+KRATOS_DEFAULT_TTL_MS}};
+  } catch { return {state:'error'}; }
+  finally { kratosInflight--; }
+}
+// 尚未初始化（没有本地账号）时不允许走 Kratos，避免绕过初始化页。
+function kratosReady() { return db.prepare('SELECT count(*) n FROM users').get().n>0; }
+async function kratosAutoLogin(req,res) {
+  if(!KRATOS_ENABLED||!kratosReady())return null;
+  const token=readCookie(req,KRATOS_SESSION_COOKIE);
+  if(!token)return null;
+  const r=await kratosWhoami(token);
+  if(r.state!=='valid')return null;
+  issueSession(res,{kratos:r.who});
+  return {id:null,name:r.who.name,role:'viewer',via:'kratos'};
+}
+// v0.5.x 的登出不读 return_to，落点由 kratos.yml 的 logout.after.default_browser_return_url 决定。
+function kratosLogoutUrl() { return KRATOS_BROWSER_URL+KRATOS_LOGOUT_PATH+'?return_to='+encodeURIComponent(PUBLIC_URL+'/'); }
 function send(res,status,data) { res.writeHead(status,{'content-type':'application/json; charset=utf-8','x-content-type-options':'nosniff'}); res.end(JSON.stringify(data)); }
 function readBody(req) { return new Promise((resolve,reject)=>{let s='';req.on('data',c=>{s+=c;if(s.length>14e6)reject(Error('Request too large'));});req.on('end',()=>{try{resolve(JSON.parse(s||'{}'));}catch{reject(Error('Invalid JSON'));}});}); }
 function cents(v) { const s=String(v); if(!/^\d{1,10}(\.\d{1,2})?$/.test(s)||Number(s)<=0)throw Error('Invalid amount'); const [a,b='']=s.split('.'); return Number(a)*100+Number((b+'00').slice(0,2)); }
@@ -62,7 +141,11 @@ function createEntryRecord(d,uploads) { const id=crypto.randomUUID(),at=new Date
 
 const server=http.createServer(async(req,res)=>{
  try {
-  const url=new URL(req.url,'http://localhost'),sid=cookie(req),uid=sessions.get(sid),user=uid?db.prepare('SELECT * FROM users WHERE id=?').get(uid):null;
+  const url=new URL(req.url,'http://localhost'),sid=cookie(req);
+  let user=sessionUser(sessions.get(sid));
+  if(!user&&sid)sessions.delete(sid);
+  // 已登录 Kratos 的成员访问首页或 /api/me 时自动建立本地会话（其余请求不触发 whoami）。
+  if(!user&&req.method==='GET'&&KRATOS_ENABLED&&(url.pathname==='/'||url.pathname==='/api/me'))user=await kratosAutoLogin(req,res);
   if(req.method==='GET'&&url.pathname==='/'){res.writeHead(200,{'content-type':'text/html; charset=utf-8'});return res.end(fs.readFileSync(path.join(BASE,'index.html')));}
   if(req.method==='GET'&&url.pathname==='/app.js'){res.writeHead(200,{'content-type':'text/javascript; charset=utf-8','cache-control':'no-cache'});return fs.createReadStream(path.join(BASE,'app.js')).pipe(res);}
   if(req.method==='GET'&&['/vendor/pdf.mjs','/vendor/pdf.worker.mjs'].includes(url.pathname)){
@@ -77,15 +160,36 @@ const server=http.createServer(async(req,res)=>{
    res.writeHead(200,{'content-type':'application/octet-stream','cache-control':'public, max-age=86400'});return fs.createReadStream(file).pipe(res);
   }
   if(req.method==='GET'&&url.pathname==='/api/setup-status')return send(res,200,{setup:db.prepare('SELECT count(*) n FROM users').get().n===0});
+  if(req.method==='GET'&&url.pathname==='/api/config'){res.setHeader('cache-control','no-store');return send(res,200,{kratos:{enabled:KRATOS_ENABLED}});}
+  if(req.method==='GET'&&url.pathname==='/api/kratos/login'){
+   if(!KRATOS_ENABLED)return send(res,404,{error:'Kratos SSO not enabled'});
+   if(!kratosReady()){res.writeHead(302,{location:'/'});return res.end();}
+   const to=encodeURIComponent(PUBLIC_URL+'/api/kratos/callback');
+   res.writeHead(302,{location:`${KRATOS_BROWSER_URL}/self-service/login/browser?return_to=${to}`,'cache-control':'no-store'});return res.end();
+  }
+  if(req.method==='GET'&&url.pathname==='/api/kratos/callback'){
+   if(!KRATOS_ENABLED)return send(res,404,{error:'Kratos SSO not enabled'});
+   if(!kratosReady()){res.writeHead(302,{location:'/'});return res.end();}
+   const token=readCookie(req,KRATOS_SESSION_COOKIE),r=token?await kratosWhoami(token):{state:'invalid'};
+   if(r.state!=='valid'){res.writeHead(302,{location:'/?kratos_error=1','cache-control':'no-store'});return res.end();}
+   sessions.delete(sid);
+   issueSession(res,{kratos:r.who});
+   res.writeHead(302,{location:'/','cache-control':'no-store'});return res.end();
+  }
   if(req.method==='POST'&&url.pathname==='/api/setup'){
    if(db.prepare('SELECT count(*) n FROM users').get().n)return send(res,403,{error:'Setup complete'});
    const b=await readBody(req);if(!b.admin||!b.viewer||b.admin===b.viewer||String(b.adminPassword).length<10||String(b.viewerPassword).length<10)throw Error('Use distinct usernames and passwords of at least 10 characters');
    transaction(()=>{db.prepare('INSERT INTO users VALUES(?,?,?,?)').run(crypto.randomUUID(),b.admin,hash(b.adminPassword),'admin');db.prepare('INSERT INTO users VALUES(?,?,?,?)').run(crypto.randomUUID(),b.viewer,hash(b.viewerPassword),'viewer');});return send(res,200,{});
   }
-  if(req.method==='POST'&&url.pathname==='/api/login'){const b=await readBody(req),u=db.prepare('SELECT * FROM users WHERE name=?').get(b.username);if(!u||!valid(String(b.password||''),u.pass))return send(res,401,{error:'Invalid username or password'});const token=crypto.randomBytes(32).toString('hex');sessions.set(token,u.id);res.setHeader('set-cookie',`sid=${token}; HttpOnly; SameSite=Strict; Path=/`);return send(res,200,{});}
-  if(req.method==='POST'&&url.pathname==='/api/logout'){sessions.delete(sid);res.setHeader('set-cookie','sid=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/');return send(res,200,{});}
+  if(req.method==='POST'&&url.pathname==='/api/login'){const b=await readBody(req),u=db.prepare('SELECT * FROM users WHERE name=?').get(b.username);if(!u||!valid(String(b.password||''),u.pass))return send(res,401,{error:'Invalid username or password'});issueSession(res,{userId:u.id});return send(res,200,{});}
+  if(req.method==='POST'&&url.pathname==='/api/logout'){
+   sessions.delete(sid);res.setHeader('set-cookie','sid=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/');
+   // 浏览器仍持有 Kratos 会话时，前端需一并跳转 Kratos 登出，否则自动识别会立刻重新登录。
+   const kc=KRATOS_ENABLED?readCookie(req,KRATOS_SESSION_COOKIE):null;
+   return send(res,200,kc?{kratosLogoutUrl:kratosLogoutUrl()}:{});
+  }
   if(!user)return send(res,401,{error:'Please log in'});
-  if(req.method==='GET'&&url.pathname==='/api/me')return send(res,200,{role:user.role,name:user.name});
+  if(req.method==='GET'&&url.pathname==='/api/me'){res.setHeader('cache-control','no-store');return send(res,200,{role:user.role,name:user.name,via:user.via||'local'});}
   if(req.method==='GET'&&url.pathname==='/api/bot/settings'){if(user.role!=='admin')return send(res,403,{error:'Admin required'});return send(res,200,{adminQqs:getBotAdmins(),connected:bot.isConnected()});}
   if(req.method==='PUT'&&url.pathname==='/api/bot/settings'){if(user.role!=='admin')return send(res,403,{error:'Admin required'});const b=await readBody(req);const list=[...new Set((Array.isArray(b.adminQqs)?b.adminQqs:[]).map(x=>String(x).trim()).filter(x=>/^\d{5,12}$/.test(x)))].slice(0,100);setSetting('bot.adminQqs',JSON.stringify(list));return send(res,200,{adminQqs:list});}
   if(req.method==='GET'&&url.pathname==='/api/ledger'){
@@ -118,7 +222,7 @@ const server=http.createServer(async(req,res)=>{
    transaction(()=>{db.prepare('UPDATE entries SET deleted=1,deleted_at=?,deleted_by=? WHERE id=?').run(at,user.name,old.id);db.prepare('INSERT INTO audit(entry_id,action,by_user,at,before_state,after_state) VALUES(?,?,?,?,?,?)').run(old.id,'delete',user.name,at,snap(old),snap(entry(old.id)));});return send(res,200,{});
   }
   if(req.method==='POST'&&url.pathname==='/api/password'){
-   if(user.role!=='admin')return send(res,403,{error:'Admin required'});const b=await readBody(req),target=db.prepare('SELECT * FROM users WHERE role=?').get(b.role);if(!target||String(b.password||'').length<10)throw Error('Password must be at least 10 characters');db.prepare('UPDATE users SET pass=? WHERE id=?').run(hash(b.password),target.id);for(const [t,id] of sessions)if(id===target.id)sessions.delete(t);return send(res,200,{});
+   if(user.role!=='admin')return send(res,403,{error:'Admin required'});const b=await readBody(req),target=db.prepare('SELECT * FROM users WHERE role=?').get(b.role);if(!target||String(b.password||'').length<10)throw Error('Password must be at least 10 characters');db.prepare('UPDATE users SET pass=? WHERE id=?').run(hash(b.password),target.id);for(const [t,s] of sessions)if(s&&s.userId===target.id)sessions.delete(t);return send(res,200,{});
   }
   if(req.method==='GET'&&url.pathname==='/api/audit'){const entryId=url.searchParams.get('entryId');const rows=db.prepare('SELECT a.id,a.entry_id entryId,a.action,a.by_user by,a.at,a.before_state before_state,a.after_state after_state,e.reason,e.kind,e.amount_cents,e.date FROM audit a LEFT JOIN entries e ON e.id=a.entry_id'+(entryId?' WHERE a.entry_id=?':'')+' ORDER BY a.id DESC').all(...(entryId?[entryId]:[]));return send(res,200,rows.map(a=>({id:a.id,entryId:a.entryId,action:a.action,by:a.by,at:a.at,before:a.before_state?JSON.parse(a.before_state):null,after:a.after_state?JSON.parse(a.after_state):null,reason:a.reason,kind:a.kind,amountCents:a.amount_cents,date:a.date})));}
   return send(res,404,{error:'Not found'});

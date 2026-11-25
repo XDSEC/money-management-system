@@ -16,6 +16,8 @@ services:
       HOST: "0.0.0.0"
       LEDGER_DATA_DIR: "/app/data"
       TZ: "${TZ:-Asia/Shanghai}"
+      # 接入 Ory Kratos 时（见 README）：KRATOS_PUBLIC_URL 填容器网络内的服务地址
+      # （如 http://kratos:4433）；PUBLIC_URL / KRATOS_BROWSER_URL 填浏览器可访问的外网地址。
 
     ports:
       # 前面有宿主机 nginx/caddy 时，在 .env 里设 BIND_IP=127.0.0.1，
